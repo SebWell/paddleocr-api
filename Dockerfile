@@ -1,0 +1,42 @@
+FROM python:3.10-slim
+
+# Installation des dépendances système
+RUN apt-get update && apt-get install -y \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Répertoire de travail
+WORKDIR /app
+
+# Copie des fichiers requirements d'abord (pour le cache Docker)
+COPY requirements.txt .
+
+# Installation des dépendances Python
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Pré-télécharger les modèles français au build
+RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(use_angle_cls=True, lang='fr', use_gpu=False, show_log=False)"
+
+# Copie de l'application
+COPY app.py .
+
+# Variables d'environnement
+ENV PORT=5000
+ENV OCR_LANG=fr
+
+# Exposition du port
+EXPOSE 5000
+
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=30s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:5000/health || exit 1
+
+# Démarrage avec Gunicorn
+# Timeout élevé car le premier chargement du modèle est long
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "300", "--preload", "app:app"]
