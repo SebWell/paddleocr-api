@@ -20,9 +20,6 @@ COPY requirements.txt .
 # Installation des dépendances Python
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pré-télécharger les modèles français au build
-RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(use_angle_cls=True, lang='fr', use_gpu=False, show_log=False)"
-
 # Copie de l'application
 COPY app.py .
 
@@ -33,8 +30,8 @@ ENV OCR_LANG=fr
 # Exposition du port
 EXPOSE 5000
 
-# Healthcheck
-HEALTHCHECK --interval=30s --timeout=30s --start-period=60s --retries=3 \
+# Healthcheck (start-period élevé car le premier chargement du modèle prend du temps)
+HEALTHCHECK --interval=30s --timeout=30s --start-period=120s --retries=3 \
     CMD curl -f http://localhost:5000/health || exit 1
 
 # Démarrage avec Gunicorn
