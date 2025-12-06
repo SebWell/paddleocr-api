@@ -4,3 +4,4 @@ paddleocr==2.7.3
 Pillow==10.1.0
 gunicorn==21.2.0
 numpy<2
+requests>=2.31.0

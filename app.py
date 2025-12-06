@@ -12,6 +12,8 @@ import io
 import base64
 import os
 import re
+import requests
+from urllib.parse import urlparse
 
 app = Flask(__name__)
 
@@ -38,6 +40,37 @@ def get_ocr_instance(lang):
 print(f"Chargement du modèle PaddleOCR ({DEFAULT_LANG})...")
 get_ocr_instance(DEFAULT_LANG)
 print("Modèle chargé !")
+
+
+def download_image_from_url(url, timeout=30):
+    """
+    Télécharge une image depuis une URL.
+
+    Args:
+        url: URL de l'image ou du PDF
+        timeout: Timeout en secondes (défaut: 30)
+
+    Returns:
+        PIL.Image: Image téléchargée
+
+    Raises:
+        ValueError: Si l'URL est invalide ou le téléchargement échoue
+    """
+    # Valider l'URL
+    parsed = urlparse(url)
+    if not parsed.scheme in ('http', 'https'):
+        raise ValueError(f"URL invalide: schéma '{parsed.scheme}' non supporté")
+
+    # Télécharger le fichier
+    response = requests.get(url, timeout=timeout, stream=True)
+    response.raise_for_status()
+
+    # Vérifier le content-type
+    content_type = response.headers.get('content-type', '').lower()
+
+    # Ouvrir comme image
+    image = Image.open(io.BytesIO(response.content)).convert("RGB")
+    return image
 
 
 def detect_structure(text):
@@ -124,12 +157,17 @@ def count_structure_stats(markdown):
 def home():
     return jsonify({
         "service": "PaddleOCR API",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "endpoints": {
-            "/ocr": "POST - Envoyer une image pour extraction de texte brut",
-            "/ocr-markdown": "POST - OCR + heuristiques pour générer du Markdown structuré",
+            "/ocr": "POST - Envoyer une image pour extraction de texte brut (multipart, base64, ou URL)",
+            "/ocr-markdown": "POST - OCR + heuristiques pour Markdown (multipart, base64, ou URL)",
             "/health": "GET - Vérifier l'état du service",
             "/languages": "GET - Lister les langues supportées"
+        },
+        "input_methods": {
+            "multipart": "Envoyer un fichier via 'image' (multipart/form-data)",
+            "base64": "Envoyer une image encodée en base64 dans JSON {'image': '...'}",
+            "url": "Envoyer une URL d'image dans JSON {'url': 'https://...'}"
         }
     })
 
@@ -166,11 +204,12 @@ def languages():
 def ocr():
     """
     Extrait le texte d'une image avec PaddleOCR
-    
+
     Accepte:
     - multipart/form-data avec fichier 'image'
     - JSON avec 'image' en base64
-    
+    - JSON avec 'url' pour télécharger l'image depuis une URL
+
     Paramètres optionnels:
     - lang: langue pour l'OCR (défaut: fr)
     - det: activer la détection de texte (défaut: true)
@@ -179,15 +218,15 @@ def ocr():
     try:
         # Récupérer les paramètres
         lang = request.form.get("lang") or request.args.get("lang") or DEFAULT_LANG
-        
+
         # Récupérer l'image
         image = None
-        
+
         # Option 1: Fichier uploadé
         if "image" in request.files:
             file = request.files["image"]
             image = Image.open(file.stream).convert("RGB")
-        
+
         # Option 2: Base64 dans JSON
         elif request.is_json and "image" in request.json:
             image_data = request.json["image"]
@@ -196,11 +235,16 @@ def ocr():
                 image_data = image_data.split(",")[1]
             image_bytes = base64.b64decode(image_data)
             image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        
+
+        # Option 3: URL dans JSON
+        elif request.is_json and "url" in request.json:
+            url = request.json["url"]
+            image = download_image_from_url(url)
+
         else:
             return jsonify({
                 "error": "Aucune image fournie",
-                "usage": "Envoyez une image via 'image' (multipart) ou en base64 (JSON)"
+                "usage": "Envoyez une image via 'image' (multipart), en base64 (JSON), ou via 'url' (JSON)"
             }), 400
         
         # Convertir en numpy array pour PaddleOCR
@@ -272,6 +316,7 @@ def ocr_markdown():
     Accepte:
     - multipart/form-data avec fichier 'image'
     - JSON avec 'image' en base64
+    - JSON avec 'url' pour télécharger l'image depuis une URL
 
     Retourne:
     - markdown: Texte avec headers Markdown (#, ##, ###)
@@ -300,10 +345,15 @@ def ocr_markdown():
             image_bytes = base64.b64decode(image_data)
             image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
+        # Option 3: URL dans JSON
+        elif request.is_json and "url" in request.json:
+            url = request.json["url"]
+            image = download_image_from_url(url)
+
         else:
             return jsonify({
                 "error": "Aucune image fournie",
-                "usage": "Envoyez une image via 'image' (multipart) ou en base64 (JSON)"
+                "usage": "Envoyez une image via 'image' (multipart), en base64 (JSON), ou via 'url' (JSON)"
             }), 400
 
         # Convertir en numpy array pour PaddleOCR
