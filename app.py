@@ -14,6 +14,7 @@ import os
 import re
 import requests
 from urllib.parse import urlparse
+from pdf2image import convert_from_bytes
 
 app = Flask(__name__)
 
@@ -42,35 +43,89 @@ get_ocr_instance(DEFAULT_LANG)
 print("Modèle chargé !")
 
 
-def download_image_from_url(url, timeout=30):
+def is_pdf(content, content_type=''):
+    """Vérifie si le contenu est un PDF."""
+    # Vérifier le magic number PDF
+    if content[:4] == b'%PDF':
+        return True
+    # Vérifier le content-type
+    if 'application/pdf' in content_type.lower():
+        return True
+    return False
+
+
+def convert_pdf_to_images(pdf_bytes, dpi=200):
     """
-    Télécharge une image depuis une URL.
+    Convertit un PDF en liste d'images.
 
     Args:
-        url: URL de l'image ou du PDF
-        timeout: Timeout en secondes (défaut: 30)
+        pdf_bytes: Contenu binaire du PDF
+        dpi: Résolution pour la conversion (défaut: 200)
 
     Returns:
-        PIL.Image: Image téléchargée
+        list[PIL.Image]: Liste d'images (une par page)
+    """
+    images = convert_from_bytes(pdf_bytes, dpi=dpi)
+    return [img.convert("RGB") for img in images]
+
+
+def download_file_from_url(url, timeout=60):
+    """
+    Télécharge un fichier depuis une URL (image ou PDF).
+
+    Args:
+        url: URL du fichier
+        timeout: Timeout en secondes (défaut: 60)
+
+    Returns:
+        tuple: (list[PIL.Image], is_pdf: bool)
+            - Liste d'images (une seule pour image, plusieurs pour PDF multi-pages)
+            - True si c'était un PDF
 
     Raises:
         ValueError: Si l'URL est invalide ou le téléchargement échoue
     """
     # Valider l'URL
     parsed = urlparse(url)
-    if not parsed.scheme in ('http', 'https'):
+    if parsed.scheme not in ('http', 'https'):
         raise ValueError(f"URL invalide: schéma '{parsed.scheme}' non supporté")
 
     # Télécharger le fichier
-    response = requests.get(url, timeout=timeout, stream=True)
+    response = requests.get(url, timeout=timeout)
     response.raise_for_status()
 
-    # Vérifier le content-type
-    content_type = response.headers.get('content-type', '').lower()
+    content = response.content
+    content_type = response.headers.get('content-type', '')
 
-    # Ouvrir comme image
-    image = Image.open(io.BytesIO(response.content)).convert("RGB")
-    return image
+    # Vérifier si c'est un PDF
+    if is_pdf(content, content_type):
+        images = convert_pdf_to_images(content)
+        return images, True
+
+    # Sinon, traiter comme une image
+    image = Image.open(io.BytesIO(content)).convert("RGB")
+    return [image], False
+
+
+def load_file_from_bytes(file_bytes, filename=''):
+    """
+    Charge un fichier depuis des bytes (image ou PDF).
+
+    Args:
+        file_bytes: Contenu binaire du fichier
+        filename: Nom du fichier (optionnel, pour détecter le type)
+
+    Returns:
+        tuple: (list[PIL.Image], is_pdf: bool)
+    """
+    # Vérifier si c'est un PDF
+    if is_pdf(file_bytes) or filename.lower().endswith('.pdf'):
+        images = convert_pdf_to_images(file_bytes)
+        return images, True
+
+    # Sinon, traiter comme une image
+    image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    return [image], False
 
 
 def detect_structure(text):
@@ -157,18 +212,19 @@ def count_structure_stats(markdown):
 def home():
     return jsonify({
         "service": "PaddleOCR API",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "endpoints": {
-            "/ocr": "POST - Envoyer une image pour extraction de texte brut (multipart, base64, ou URL)",
-            "/ocr-markdown": "POST - OCR + heuristiques pour Markdown (multipart, base64, ou URL)",
+            "/ocr": "POST - Envoyer une image pour extraction de texte brut",
+            "/ocr-markdown": "POST - OCR + heuristiques pour Markdown (supporte PDF multi-pages)",
             "/health": "GET - Vérifier l'état du service",
             "/languages": "GET - Lister les langues supportées"
         },
         "input_methods": {
             "multipart": "Envoyer un fichier via 'image' (multipart/form-data)",
             "base64": "Envoyer une image encodée en base64 dans JSON {'image': '...'}",
-            "url": "Envoyer une URL d'image dans JSON {'url': 'https://...'}"
-        }
+            "url": "Envoyer une URL d'image ou PDF dans JSON {'url': 'https://...'}"
+        },
+        "supported_formats": ["PNG", "JPG", "JPEG", "WEBP", "PDF (multi-pages)"]
     })
 
 
@@ -305,7 +361,7 @@ def ocr():
 @app.route("/ocr-markdown", methods=["POST"])
 def ocr_markdown():
     """
-    Extrait le texte d'une image avec PaddleOCR puis applique des heuristiques
+    Extrait le texte d'une image ou PDF avec PaddleOCR puis applique des heuristiques
     pour détecter la structure et générer du Markdown.
 
     Utilisé dans le flux hybride:
@@ -314,27 +370,30 @@ def ocr_markdown():
     3. Si has_structure=false, le client peut fallback vers Marker API
 
     Accepte:
-    - multipart/form-data avec fichier 'image'
+    - multipart/form-data avec fichier 'image' (image ou PDF)
     - JSON avec 'image' en base64
-    - JSON avec 'url' pour télécharger l'image depuis une URL
+    - JSON avec 'url' pour télécharger l'image/PDF depuis une URL
 
     Retourne:
     - markdown: Texte avec headers Markdown (#, ##, ###)
     - text: Texte brut original (sans headers)
     - has_structure: True si des titres ont été détectés
     - source: "paddleocr"
+    - page_count: Nombre de pages traitées (pour PDFs)
     """
     try:
         # Récupérer les paramètres
         lang = request.form.get("lang") or request.args.get("lang") or DEFAULT_LANG
 
-        # Récupérer l'image
-        image = None
+        # Liste d'images à traiter (une pour image, plusieurs pour PDF)
+        images = []
+        is_pdf_file = False
 
-        # Option 1: Fichier uploadé
+        # Option 1: Fichier uploadé (image ou PDF)
         if "image" in request.files:
             file = request.files["image"]
-            image = Image.open(file.stream).convert("RGB")
+            file_bytes = file.read()
+            images, is_pdf_file = load_file_from_bytes(file_bytes, file.filename or '')
 
         # Option 2: Base64 dans JSON
         elif request.is_json and "image" in request.json:
@@ -343,42 +402,50 @@ def ocr_markdown():
             if "," in image_data:
                 image_data = image_data.split(",")[1]
             image_bytes = base64.b64decode(image_data)
-            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            images, is_pdf_file = load_file_from_bytes(image_bytes)
 
-        # Option 3: URL dans JSON
+        # Option 3: URL dans JSON (image ou PDF)
         elif request.is_json and "url" in request.json:
             url = request.json["url"]
-            image = download_image_from_url(url)
+            images, is_pdf_file = download_file_from_url(url)
 
         else:
             return jsonify({
                 "error": "Aucune image fournie",
-                "usage": "Envoyez une image via 'image' (multipart), en base64 (JSON), ou via 'url' (JSON)"
+                "usage": "Envoyez une image/PDF via 'image' (multipart), en base64 (JSON), ou via 'url' (JSON)"
             }), 400
-
-        # Convertir en numpy array pour PaddleOCR
-        img_array = np.array(image)
 
         # Obtenir l'instance OCR
         ocr_engine = get_ocr_instance(lang)
 
-        # Extraction du texte
-        result = ocr_engine.ocr(img_array, cls=True)
-
-        # Parser les résultats
-        lines = []
+        # Traiter toutes les pages
+        all_lines = []
         total_confidence = 0
+        total_line_count = 0
 
-        if result and result[0]:
-            for line in result[0]:
-                text = line[1][0]
-                confidence = line[1][1]
-                lines.append(text)
-                total_confidence += confidence
+        for page_idx, image in enumerate(images):
+            # Convertir en numpy array pour PaddleOCR
+            img_array = np.array(image)
+
+            # Extraction du texte
+            result = ocr_engine.ocr(img_array, cls=True)
+
+            # Parser les résultats de cette page
+            if result and result[0]:
+                for line in result[0]:
+                    text = line[1][0]
+                    confidence = line[1][1]
+                    all_lines.append(text)
+                    total_confidence += confidence
+                    total_line_count += 1
+
+            # Ajouter un saut de page entre les pages PDF
+            if is_pdf_file and page_idx < len(images) - 1:
+                all_lines.append("\n---\n")  # Séparateur de page
 
         # Texte brut
-        raw_text = "\n".join(lines)
-        avg_confidence = (total_confidence / len(lines) * 100) if lines else 0
+        raw_text = "\n".join(all_lines)
+        avg_confidence = (total_confidence / total_line_count * 100) if total_line_count else 0
 
         # Appliquer les heuristiques pour détecter la structure
         markdown_text, has_structure = detect_structure(raw_text)
@@ -394,7 +461,9 @@ def ocr_markdown():
             "has_structure": has_structure,
             "language": lang,
             "confidence": round(avg_confidence, 2),
-            "lines_count": len(lines),
+            "lines_count": total_line_count,
+            "page_count": len(images),
+            "is_pdf": is_pdf_file,
             "structure_stats": structure_stats
         })
 
